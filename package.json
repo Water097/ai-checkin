@@ -1,0 +1,16 @@
+{
+  "name": "ai-checkin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WorkBuddy 每日签到 + Buddy 旅行自动领取 · Cloudflare Worker",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "bundle": "wrangler deploy --dry-run --outdir=dist",
+    "test": "node --test tests/core.test.js tests/wb.test.js tests/worker.test.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.144.0"
+  }
+}

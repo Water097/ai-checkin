@@ -1,0 +1,27 @@
+name = "ai-checkin"
+main = "src/index.js"
+compatibility_date = "2026-11-13"
+keep_vars = true
+
+# 部署前换成自己的 KV namespace id：
+#   npx wrangler kv namespace create CHECKIN_KV
+# 本地 `npm run dev` 用的是模拟 KV，可以先不换。
+[[kv_namespaces]]
+binding = "CHECKIN_KV"
+id = "00000000000000000000000000000000"
+
+[triggers]
+# 每 30 分钟醒一次；是否该干活由代码按逻辑日 + 服务端状态判定。
+# 免费版每账号 5 条 cron，一条足够，加功能不需要加 cron 槽。
+crons = ["*/30 * * * *"]
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+
+# 可选：把业务侧上限压到 45，给重试留 5 次。
+# Cloudflare 免费版每次调用 50 次外部 fetch 是平台硬顶，撞顶会整次调用作废。
+# [vars]
+# BUDGET_SUBREQUESTS = "45"
