@@ -34,7 +34,11 @@ function applyResults(state, results, now) {
     state.credits = (state.credits || 0) + (Number(row.credits) || 0);
   }
   state.lastAt = now;
-  state.lastMessage = results.map((r) => `${r.id}:${r.status}`).join(" ");
+  // 首页直接显示人话（含到站时间），不用再点进诊断页才知道 Buddy 在哪一站。
+  state.lastMessage = truncate(
+    results.filter((r) => r.status !== "reused").map((r) => r.message).join("；") || "今日已处理",
+    180,
+  );
 }
 
 function aggregate(results) {

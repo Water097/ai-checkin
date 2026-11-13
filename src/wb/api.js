@@ -200,7 +200,10 @@ const STATE_KEYS = [
 const CLAIMABLE = /^(arrived|claimable|pending_?claim|waiting_?claim|can_?claim|finished|completed|done|reward_?pending|unclaimed|ready_?to_?claim)$|待领|可领|到站|已完成|可领取|领取礼物|待收取|等待领取/i;
 const TRAVELING = /^(travel+ing|in_?transit|on_?trip|departed|running|in_?progress|ongoing|started)$|旅途中|派送中|进行中|在途|已出发/i;
 const IDLE = /^(idle|none|not_?started|ready|unstarted)$|未开始|未出发|待出发/i;
-const NO_GIFT = /no_?reward|nothing_?to_?claim|not_?arrived|already_?claimed|no_?gift|无可领|未到站|已领取|尚未到达|没有.*礼物|nothing.*claim/i;
+const NO_GIFT = /no_?reward|nothing_?to_?claim|already_?claimed|no_?gift|无可领|已领取|没有.*礼物|nothing.*claim/i;
+// 「还没到站」必须单独成类：它既不是领取成功，也不是「没有礼物」。
+// 混进 no_gift 会让状态机以为可以派下一趟，把在途行程顶掉。
+const NOT_ARRIVED = /not[\s_-]*arrived|未到站|尚未到达|还没到|not[\s_-]*yet/i;
 
 // 上游状态字段换过版、也可能藏在 travel / trip / buddy 这类子对象里。
 // 不再假设单一键名：受限深度遍历整份响应，收集所有可能的状态值，按「有礼可领 → 在途 → 空闲」的优先顺序判定。
@@ -242,17 +245,41 @@ export function travelStateOf(payload) {
   return { kind: "unknown", value: "未识别", path: "$", raw, found };
 }
 
+// 旅行时间：上游给秒级时间戳（也可能是毫秒或字符串），统一换算成秒。
+// 判断「到点没到点」要看 server_now 与 arrive_at 的差，不能只信 state：
+// 上游状态更新可能滞后，已经到点了还报 traveling。
+export function travelTimingOf(payload) {
+  const toSec = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+  };
+  const departSec = toSec(dig(payload, "depart_at") ?? dig(payload, "depart_time"));
+  const arriveSec = toSec(dig(payload, "arrive_at") ?? dig(payload, "arrive_time"));
+  const nowSec = toSec(dig(payload, "server_now") ?? dig(payload, "now") ?? dig(payload, "timestamp"));
+  const remaining = arriveSec !== null && nowSec !== null ? arriveSec - nowSec : null;
+  return { departSec, arriveSec, nowSec, remaining, due: remaining !== null && remaining <= 0 };
+}
+
 // 领取结果三分：收到了 / 上游明确说没礼物 / 真失败。
 // 「没礼物」要走继续派发的路，不能当成失败把流程卡死。
 export function judgeClaimTravel(result) {
   const code = codeOf(result.payload);
   const msg = bizMessage(result);
   const text = `${msg} ${String(result.raw || "")}`;
+  if (NOT_ARRIVED.test(text)) {
+    return { kind: "not_arrived", credits: 0, message: `行程尚未到站${msg ? `（${msg}）` : ""}` };
+  }
   if (NO_GIFT.test(text) || code === 10001) {
     return { kind: "no_gift", credits: 0, message: "上游报没有待领礼物" };
   }
   if (okResult(result)) {
     const reward = dig(result.payload, "reward_credit") ?? dig(result.payload, "credit") ?? dig(result.payload, "reward");
+    // 上游说成功却没给任何奖励字段：绝不能当成「已收礼」。
+    // 旧版就是在这种模糊应答之后继续派行程，把待领礼物顶掉了。
+    if (reward === null || reward === undefined) {
+      return { kind: "uncertain", credits: 0, message: "领取接口没返回奖励金额，无法确认是否已收礼" };
+    }
     return { kind: "claimed", credits: num(reward), message: `回收到站礼物 +${num(reward)}` };
   }
   return {

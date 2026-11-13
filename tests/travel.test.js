@@ -164,3 +164,112 @@ test("诊断页：显示上游原始响应与解析结论，且只读、不泄�
   assert.equal(calls.includes(CLAIM), false);
   assert.equal(calls.includes(DEPART), false);
 });
+
+const LIVE = { depart_at: 1794539422, arrive_at: 1794546622, server_now: 1794540085, daily_limit_reached: true };
+
+test("时间解析：截图里的真实响应，剩余 1 小时 48 分", async () => {
+  const { travelTimingOf } = await import("../src/wb/api.js");
+  const { fmtCSTSec, humanGap } = await import("../src/core/time.js");
+  const t = travelTimingOf({ data: LIVE });
+  assert.equal(t.remaining, 6537);
+  assert.equal(t.due, false);
+  assert.equal(humanGap(t.remaining), "1 小时 48 分");
+  assert.equal(fmtCSTSec(t.departSec), "2026-11-13 11:10:22");
+  assert.equal(fmtCSTSec(t.arriveSec), "2026-11-13 13:10:22");
+});
+
+test("在途未到点：等待，日志显示北京时间与剩余时长，不再有裸时间戳", async () => {
+  const { ctx } = await fixture();
+  const calls = mockFetch(routes({ code: 0, data: { state: "traveling", ...LIVE } }));
+  const out = await runTravel(ctx, newDay("2026-11-13"));
+  assert.equal(out.status, "waiting");
+  assert.match(out.message, /13:10:22/);
+  assert.match(out.message, /还需 1 小时 48 分/);
+  assert.match(out.message, /今日旅行次数已用尽/);
+  assert.equal(out.message.includes("1794546622"), false);
+  assert.equal(calls.includes(CLAIM), false);
+  assert.equal(calls.includes(DEPART), false);
+});
+
+test("已过到站时间但仍报在途：主动试领，收礼后也绝不派新行程", async () => {
+  const { ctx } = await fixture();
+  const calls = mockFetch(routes({
+    code: 0, data: { state: "traveling", arrive_at: 1794540000, server_now: 1794546622 },
+  }));
+  const out = await runTravel(ctx, newDay("2026-11-13"));
+  assert.equal(out.credits, 20);
+  assert.match(out.message, /主动试领/);
+  assert.match(out.message, /不派新行程/);
+  assert.equal(calls.filter((p) => p === CLAIM).length, 1);
+  assert.equal(calls.includes(DEPART), false);
+});
+
+test("领取应答没给奖励金额：判未确认，绝不派行程", async () => {
+  const { judgeClaimTravel } = await import("../src/wb/api.js");
+  assert.equal(judgeClaimTravel({ status: 200, payload: { code: 0, data: {} } }).kind, "uncertain");
+  const { ctx } = await fixture();
+  const calls = mockFetch(routes({ code: 0, data: { state: "arrived" } }, {
+    [CLAIM]: { body: { code: 0, data: {} } },
+  }));
+  const out = await runTravel(ctx, newDay("2026-11-13"));
+  assert.equal(out.status, "error");
+  assert.match(out.message, /不派新行程/);
+  assert.equal(calls.includes(DEPART), false);
+});
+
+test("诊断页显示出发/到站/剩余时间与今日次数", async () => {
+  const { default: worker } = await import("../src/index.js");
+  const kv = makeKv();
+  await saveAccount(kv, "uid-travel-001", {
+    uid: "uid-travel-001", label: "主号", enabled: true,
+    cred: { accessToken: ACCESS, refreshToken: "REFRESH_TRAVEL_VALUE", expiresAt: String(NOW + 30 * 86400) },
+  });
+  mockFetch(routes({ code: 0, data: { state: "traveling", ...LIVE } }));
+  const res = await worker.fetch(
+    new Request("http://localhost/travel/uid-travel-001?pwd=pw"),
+    { CHECKIN_KV: kv, PASSWORD: "pw" },
+  );
+  const html = await res.text();
+  assert.match(html, /11:10:22/);
+  assert.match(html, /13:10:22/);
+  assert.match(html, /还需 1 小时 48 分/);
+  assert.match(html, /今日旅行次数已用尽/);
+});
+
+test("主动领取按钮：直连 claim 并把上游原始响应摆出来", async () => {
+  const { default: worker } = await import("../src/index.js");
+  const kv = makeKv();
+  await saveAccount(kv, "uid-travel-001", {
+    uid: "uid-travel-001", label: "主号", enabled: true,
+    cred: { accessToken: ACCESS, refreshToken: "REFRESH_TRAVEL_VALUE", expiresAt: String(NOW + 30 * 86400) },
+  });
+  const calls = mockFetch(routes({ code: 0, data: {} }, {
+    [CLAIM]: { body: { code: 0, msg: "OK", data: { reward_credit: 5 } } },
+  }));
+  const res = await worker.fetch(
+    new Request("http://localhost/account/uid-travel-001/claim?pwd=pw", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", "content-length": "5" },
+      body: "pwd=pw",
+    }),
+    { CHECKIN_KV: kv, PASSWORD: "pw" },
+  );
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.match(html, /领取结果/);
+  assert.match(html, /领取成功|reward_credit/);
+  assert.equal(calls.includes(DEPART), false);
+  assert.equal(html.includes(ACCESS), false);
+});
+
+test("未到站单独归类，绝不当成没礼物继续派行程", async () => {
+  const { judgeClaimTravel } = await import("../src/wb/api.js");
+  assert.equal(judgeClaimTravel({ status: 403, payload: { code: 403, msg: "not arrived yet" } }).kind, "not_arrived");
+  const { ctx } = await fixture();
+  const calls = mockFetch(routes({ code: 0, data: { state: "unknown_value" } }, {
+    [CLAIM]: { status: 403, body: { code: 403, msg: "not arrived yet" } },
+  }));
+  const out = await runTravel(ctx, newDay("2026-11-13"));
+  assert.equal(out.status, "error");
+  assert.equal(calls.includes(DEPART), false);
+});

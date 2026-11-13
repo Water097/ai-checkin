@@ -1,5 +1,7 @@
 import { page, esc } from "./core/http.js";
 import { maskUid, credState } from "./core/accounts.js";
+import { travelTimingOf, dig } from "./wb/api.js";
+import { fmtCSTSec, humanGap } from "./core/time.js";
 
 const q = (pwd) => (pwd ? `?pwd=${encodeURIComponent(pwd)}` : "");
 const hidden = (name, value) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`;
@@ -105,6 +107,7 @@ export function homePage({ accounts, days, logs, pwd, flash, now }) {
       <div class="row" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
         <form class="inline" method="post" action="/account/${uid}/test${p}">${hidden("pwd", pwd)}<button class="btn" type="submit">测试连接</button></form>
         <a class="btn" href="/travel/${uid}${p}">旅行状态</a>
+        <form class="inline" method="post" action="/account/${uid}/claim${p}">${hidden("pwd", pwd)}<button class="btn" type="submit">立即领礼物</button></form>
         <form class="inline" method="post" action="/account/${uid}/run${p}">${hidden("pwd", pwd)}<button class="btn primary" type="submit">立即执行</button></form>
         <form class="inline" method="post" action="/account/${uid}/toggle${p}">${hidden("pwd", pwd)}<button class="btn" type="submit">${a.enabled === false ? "启用" : "停用"}</button></form>
         <form class="inline" method="post" action="/account/${uid}/delete${p}">${hidden("pwd", pwd)}<button class="btn danger" type="submit">删除</button></form>
@@ -144,6 +147,35 @@ export function homePage({ accounts, days, logs, pwd, flash, now }) {
       <p style="margin-top:12px"><a href="/runs${p}">查看全部日志 →</a></p>` : `<div class="empty">还没有运行记录。</div>`}`);
 }
 
+// 主动领取的结果页：把上游原始响应一起摆出来，确认「昨天的礼物还在不在」。
+export function claimResultPage({ pwd, uid, label, result, raw, meta }) {
+  const p = q(pwd);
+  const text = {
+    claimed: "领取成功", no_gift: "上游明确说没有待领礼物",
+    not_arrived: "还没到站（等到站后再领）", uncertain: "结果不明确，未确认领取", failed: "领取失败",
+  }[result?.kind] || "未知结果";
+  const tone = result?.kind === "claimed" ? "claimed"
+    : result?.kind === "not_arrived" ? "waiting"
+      : result?.kind === "no_gift" ? "already" : "error";
+  return page("领取结果", `
+    <p class="sub"><a href="/${p}">← 回到总览</a></p>
+    <div class="card"><div class="row between"><div><span class="name">${esc(label)}</span>
+      <span class="uid">${esc(uid)}</span></div><div>${badge(tone)} ${esc(text)}</div></div>
+      <p class="meta">${esc(result?.message || "")} ｜ 本轮 +${Number(result?.credits) || 0} 积分</p>
+      ${meta ? `<p class="small mono">${esc(meta)}</p>` : ""}</div>
+    <h2>上游原始响应</h2><pre>${esc(raw || "（空响应体）")}</pre>
+    <div class="note ${result?.kind === "no_gift" ? "error" : ""}">${
+      result?.kind === "no_gift"
+        ? "上游明确报「没有待领礼物」：昨天那趟多半已被新行程覆盖，接口层没有历史补领入口，本工具找不回来。"
+        : result?.kind === "uncertain"
+          ? "上游返回空响应：通常表示当前没有待领礼物（行程还在途中，或旧记录已被新行程覆盖）。这种情况下本工具不会派新行程。"
+          : "领取接口是幂等的，多点几次不会重复扣；但如果上游一直说没有礼物，就说明记录已被覆盖。"
+    }</div>
+    <div class="row" style="margin-top:16px">
+      <a class="btn" href="/travel/${esc(uid)}${p}">查看旅行状态</a>
+      <form class="inline" method="post" action="/account/${esc(uid)}/claim${p}">${hidden("pwd", pwd)}<button class="btn primary" type="submit">再领一次</button></form></div>`);
+}
+
 // 只读诊断页：把上游旅行状态的原始响应摆出来，避免再靠猜字段。
 export function travelStatusPage({ pwd, uid, label, payload, info, error }) {
   const p = q(pwd);
@@ -153,6 +185,15 @@ export function travelStatusPage({ pwd, uid, label, payload, info, error }) {
   };
   const raw = payload ? JSON.stringify(payload, null, 2) : "（无响应）";
   const tone = info?.kind === "claimable" ? "claimed" : info?.kind === "traveling" ? "waiting" : "pending";
+  const timing = payload ? travelTimingOf(payload) : null;
+  const limitRaw = payload ? dig(payload, "daily_limit_reached") : null;
+  const limitText = limitRaw === true || limitRaw === 1 ? "今日旅行次数已用尽" : "今日旅行次数未用尽";
+  const remainingText = !timing || timing.remaining === null ? "剩余时间未知"
+    : timing.remaining > 0 ? `还需 ${humanGap(timing.remaining)} 到站`
+      : "到站时间已过（上游状态可能滞后，会主动试领）";
+  const nextText = info?.kind === "traveling"
+    ? (timing?.due ? "已过到站时间，主动试领；仍标记在途则不派新行程" : "等下一轮到站后再收")
+    : info?.kind === "idle" ? "可以派新行程" : "先试领取，成功后再派";
   return page("旅行状态诊断", `
     <p class="sub">只读诊断：不领礼物、不派行程、不改任何状态。用来确认上游到底返回了什么。</p>
     ${error ? `<div class="note error">${esc(error)}</div>` : ""}
@@ -162,8 +203,10 @@ export function travelStatusPage({ pwd, uid, label, payload, info, error }) {
         <dt>解析结论</dt><dd>${esc(kindText[info?.kind] || "未识别")}</dd>
         <dt>命中的字段</dt><dd class="mono">${esc(info?.path || "—")} = ${esc(info?.value || "—")}</dd>
         <dt>扫描到的状态</dt><dd class="mono">${esc(info?.raw || "—")}</dd>
-        <dt>下一步动作</dt><dd>${esc(info?.kind === "traveling" ? "等下一轮到站后再收"
-          : info?.kind === "idle" ? "可以派新行程" : "先试领取，成功后再派")}</dd>
+        <dt>出发 / 到站</dt><dd class="mono">${esc(fmtCSTSec(timing?.departSec))} → ${esc(fmtCSTSec(timing?.arriveSec))}</dd>
+        <dt>服务端时间</dt><dd class="mono">${esc(fmtCSTSec(timing?.nowSec))} · ${esc(remainingText)}</dd>
+        <dt>今日次数</dt><dd>${esc(limitText)}</dd>
+        <dt>下一步动作</dt><dd>${esc(nextText)}</dd>
       </dl></div>
     <h2>上游原始响应</h2><pre>${esc(raw)}</pre>
     <div class="row" style="margin-top:18px">

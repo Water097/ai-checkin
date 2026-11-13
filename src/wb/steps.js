@@ -2,11 +2,10 @@
 // 每一步都必须可安全重入：一轮被掐死、下轮重跑，上游只会看到幂等应答。
 import * as api from "./api.js";
 import { scrub, truncate } from "../core/logs.js";
+import { fmtCSTSec, humanGap } from "../core/time.js";
 
 function guarded(guard) {
-  if (guard && guard.error) {
-    return { status: "login_required", message: guard.error, credits: 0 };
-  }
+  if (guard && guard.error) return { status: "login_required", message: guard.error, credits: 0 };
   return null;
 }
 
@@ -15,6 +14,15 @@ function warnOf(guard) {
 }
 
 const truthy = (v) => v === true || v === 1 || v === "true" || v === "1";
+
+// 上游给的是秒级时间戳，日志里直接打 1794546622 没人看得懂。
+function timingText(timing) {
+  if (!timing || timing.arriveSec === null) return "到站时间未知";
+  const when = fmtCSTSec(timing.arriveSec);
+  if (timing.remaining === null) return `预计 ${when} 到站`;
+  if (timing.remaining > 0) return `预计 ${when} 到站（还需 ${humanGap(timing.remaining)}）`;
+  return `预计 ${when} 到站，时间已过`;
+}
 
 // ── 每日签到 ────────────────────────────────────────────────────────────
 export async function runCheckin(ctx, day) {
@@ -50,9 +58,11 @@ export async function runCheckin(ctx, day) {
 // ── 旅行：读状态 → 有礼先收 → 再派下一趟 ────────────────────────────────
 // 不做阻塞等待：Worker 里阻塞等于烧子请求 + 撞超时，改成每 30 分钟轻量轮询。
 //
-// 关键：绝不把「认不出来的状态」当成 idle。上游状态字段换过版、也可能藏在
-// travel / trip 子对象里；认错成 idle 会直接派新行程，把待领的礼物顶掉。
-// 所以状态不明确时先试一次 claim（幂等），让上游自己回答有没有礼物。
+// 两条铁律：
+// 1. 绝不把「认不出来的状态」当成 idle。上游状态字段换过版、也可能藏在子对象里；
+//    认错成 idle 会直接派新行程，把待领的礼物顶掉。状态不明确时先试一次 claim（幂等）。
+// 2. 只要上游还标记 traveling，即使到了 arrive_at、即使收礼成功，也**不派新行程**。
+//    派新行程可能把这趟在途的礼物顶掉，代价远高于多等一轮。
 export async function runTravel(ctx, day) {
   if (day.travel === "done") {
     return { status: "reused", message: "旅行今日已收工", credits: 0 };
@@ -67,18 +77,24 @@ export async function runTravel(ctx, day) {
   }
 
   const info = api.travelStateOf(first.payload);
+  const timing = api.travelTimingOf(first.payload);
+  const limit = truthy(api.dig(first.payload, "daily_limit_reached") ?? api.dig(first.payload, "daily_limit"));
+  const wasTraveling = info.kind === "traveling";
   // 把判定依据写进日志：下次上游再换字段，看一条运行记录就知道我们读到了什么。
   const notes = [`state=${info.raw} → ${info.kind}`];
   let credits = 0;
 
-  if (info.kind === "traveling") {
-    const arriveAt = api.dig(first.payload, "arrive_at") ?? api.dig(first.payload, "arrive_time");
-    notes.push(`旅行在途，不重复出发${arriveAt ? `（预计 ${String(arriveAt).slice(0, 16)}）` : ""}`);
+  // 在途且没到点：纯等待，不发任何写请求。
+  if (wasTraveling && !timing.due) {
+    notes.push(`旅行在途，${timingText(timing)}，不重复出发`);
+    if (limit) notes.push("今日旅行次数已用尽");
     return { status: "waiting", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits: 0 };
   }
 
-  // claimable / unknown 都先收礼；只有明确 idle 才跳过 claim 省一次请求。
+  // 有礼可领 / 状态未知 / 在途但已过到站时间 → 先试领取，由上游回答有没有礼物。
+  // 只有明确 idle 才跳过 claim 省一次请求。
   if (info.kind !== "idle") {
+    if (wasTraveling) notes.push("已过到站时间但上游仍报在途，主动试领");
     const judged = api.judgeClaimTravel(await api.claimTravel(ctx));
     if (judged.kind === "claimed") {
       credits += judged.credits;
@@ -93,8 +109,16 @@ export async function runTravel(ctx, day) {
     }
   }
 
-  const limit = api.dig(first.payload, "daily_limit_reached") ?? api.dig(first.payload, "daily_limit");
-  if (truthy(limit)) {
+  // 上游仍认为在途：等它把状态更新成 arrived / idle，下一轮再决定是否派。
+  if (wasTraveling) {
+    notes.push("上游仍标记在途，本轮不派新行程，等状态更新");
+    return {
+      status: credits > 0 ? "claimed" : "waiting",
+      message: truncate(scrub(notes.join("，"), ctx.secrets)), credits,
+    };
+  }
+
+  if (limit) {
     notes.push("今日旅行次数已用尽");
     return { status: "done", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits };
   }

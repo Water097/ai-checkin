@@ -10,3 +10,17 @@ export function logicalDay(nowSec) {
 export function fmtCST(ms) {
   return new Date(ms + CST_OFFSET * 1000).toISOString().replace("T", " ").slice(0, 19);
 }
+
+export function fmtCSTSec(sec) {
+  return Number(sec) > 0 ? fmtCST(Number(sec) * 1000) : "—";
+}
+
+export function humanGap(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} 分钟`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm ? `${h} 小时 ${mm} 分` : `${h} 小时`;
+}

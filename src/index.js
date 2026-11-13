@@ -1,13 +1,13 @@
 import { authenticate } from "./core/gate.js";
 import { htmlRes, jsonRes, esc } from "./core/http.js";
-import { renderGate, renderFatal, renderUnconfigured, renderResult, homePage, runsPage, setupPage, travelStatusPage } from "./ui.js";
+import { renderGate, renderFatal, renderUnconfigured, renderResult, homePage, runsPage, setupPage, travelStatusPage, claimResultPage } from "./ui.js";
 import { requireKv } from "./core/kv.js";
 import { listAccounts, getAccount, saveAccount, deleteAccount, secretValuesOf } from "./core/accounts.js";
 import { runTick, runAccount, validateAccount, nowSec } from "./core/runner.js";
 import { makeBudget, budgetFrom, trackedFetch } from "./core/budget.js";
 import { listLogs, scrub } from "./core/logs.js";
 import { dayOf, loadDay } from "./core/state.js";
-import { uidOf, HOSTS, readTravelStatus, travelStateOf, ensureAuth, isAuthFail } from "./wb/api.js";
+import { uidOf, HOSTS, readTravelStatus, travelStateOf, ensureAuth, isAuthFail, claimTravel, judgeClaimTravel } from "./wb/api.js";
 import { sendSms, exchangeToken, validPhone, maskPhone } from "./wb/login.js";
 import { expiresAtOf, isEncrypted } from "./core/jwt.js";
 import { VERSION } from "./version.js";
@@ -142,13 +142,39 @@ async function dispatch(request, url, env, auth) {
     return flash(`账号「${label}」已保存`, pwd);
   }
 
-  const match = /^\/account\/([^/]+)\/(test|run|delete|toggle)$/.exec(path);
+  const match = /^\/account\/([^/]+)\/(test|run|claim|delete|toggle)$/.exec(path);
   if (method === "POST" && match) {
     let uid;
     try { uid = decodeURIComponent(match[1]); } catch { return htmlRes(renderFatal("路径编码不合法"), 400); }
     const action = match[2];
     const account = await getAccount(kv, uid);
     if (!account) return flash("账号不存在或记录已损坏", pwd);
+
+    // 主动领取：绕过状态机直接打一次 claim，把上游原始响应摆出来。
+    // 用于「昨天到站的礼物疑似被覆盖」这类需要人工确认的场景。claim 幂等，多点安全。
+    if (action === "claim") {
+      const budget = makeBudget(budgetFrom(env));
+      const now = nowSec();
+      const ctx = {
+        account, kv, budget, now, day: dayOf(now), trigger: "manual:claim",
+        timeoutMs: 15000, fetch: trackedFetch(budget, HOSTS),
+        secrets: secretValuesOf(account), renewAttempted: false,
+      };
+      const guard = await ensureAuth(ctx);
+      if (guard.error) {
+        return htmlRes(claimResultPage({
+          pwd, uid, label: account.label, raw: "（续期失败，未发起领取）",
+          result: { kind: "failed", message: guard.error, credits: 0 },
+        }));
+      }
+      const res = await claimTravel(ctx);
+      const result = judgeClaimTravel(res);
+      const secrets = [...new Set([...ctx.secrets, ...secretValuesOf(account)])];
+      const body = String(res.raw || JSON.stringify(res.payload ?? {}, null, 2));
+      const raw = scrub(body, secrets).slice(0, 4000);
+      const meta = `HTTP ${res.status} · code=${(res.payload && res.payload.code) ?? "无"} · 响应体 ${body.length} 字节`;
+      return htmlRes(claimResultPage({ pwd, uid, label: account.label, result, raw, meta }));
+    }
 
     if (action === "delete") {
       await deleteAccount(kv, uid);
