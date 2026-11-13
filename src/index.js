@@ -9,8 +9,7 @@ import { listLogs } from "./core/logs.js";
 import { dayOf, loadDay } from "./core/state.js";
 import { uidOf } from "./wb/api.js";
 import { expiresAtOf, isEncrypted } from "./core/jwt.js";
-
-export const VERSION = "0.1.0";
+import { VERSION } from "./version.js";
 
 function redirect(path, pwd) {
   const sep = path.includes("?") ? "&" : "?";

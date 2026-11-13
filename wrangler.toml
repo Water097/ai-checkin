@@ -1,6 +1,6 @@
 name = "ai-checkin"
 main = "src/index.js"
-compatibility_date = "2026-11-13"
+compatibility_date = "2026-10-26"
 keep_vars = true
 
 # 部署前换成自己的 KV namespace id：

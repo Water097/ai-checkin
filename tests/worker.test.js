@@ -1,7 +1,8 @@
 // 直接调 Worker 的 fetch / scheduled 入口，证明「能跑」，不需要 wrangler、不联网。
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { VERSION } from "../src/index.js";
+import worker from "../src/index.js";
+import { VERSION } from "../src/version.js";
 import { makeKv } from "./kv.mock.js";
 import { getAccount } from "../src/core/accounts.js";
 
