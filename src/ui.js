@@ -2,7 +2,7 @@ import { page, esc } from "./core/http.js";
 import { maskUid, credState } from "./core/accounts.js";
 
 const q = (pwd) => (pwd ? `?pwd=${encodeURIComponent(pwd)}` : "");
-const hidden = (pwd) => `<input type="hidden" name="pwd" value="${esc(pwd)}">`;
+const hidden = (name, value) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`;
 
 const STATUS_TEXT = {
   claimed: "已领取", already: "今日已领", inactive: "活动未开", waiting: "等待中",
@@ -21,76 +21,126 @@ function badge(status, state) {
 
 export function renderGate() {
   return page("需要口令", `<p class="sub">这个页面受口令保护。</p>
-    <div class="card"><form method="post" action="/">
-      <label>访问口令</label><input type="password" name="pwd" autocomplete="current-password" required>
-      <p style="margin-top:14px"><button class="btn primary" type="submit">进入</button></p>
-    </form></div>`);
+    <div class="card" style="max-width:420px;margin:0 auto">
+      <form method="post" action="/">
+        <label>访问口令</label><input type="password" name="pwd" autocomplete="current-password" required autofocus>
+        <p style="margin-top:18px"><button class="btn primary lg" type="submit">进入签到台</button></p>
+      </form></div>`);
 }
 
 export function renderUnconfigured() {
-  return page("还没配好", `<div class="note">Worker 上没有 <code>PASSWORD</code>。
+  return page("还没配好", `<div class="note error">Worker 上没有 <code>PASSWORD</code>。
     线上用 <code>npx wrangler secret put PASSWORD</code>，本地在 <code>.dev.vars</code> 里填。</div>`);
 }
 
 export function renderFatal(message) {
-  return page("出错了", `<div class="note">${esc(message)}</div>`);
+  return page("出错了", `<div class="note error">${esc(message)}</div>
+    <p><a href="/">回到首页</a></p>`);
 }
 
 export function renderResult(title, result, pwd) {
   const rows = (result.steps || []).map((s) => `<tr><td class="mono">${esc(s.id)}</td><td>${badge(s.status)}</td><td>${esc(s.message)}</td></tr>`).join("");
   return page(title, `
     <p class="sub"><a href="/${q(pwd)}">← 回到总览</a></p>
-    <div class="card"><div class="row"><div class="grow"><span class="name">${esc(result.label || result.uid || "")}</span>
-      ${badge(result.status)}</div><div class="small">本轮 +${Number(result.credits) || 0} 积分 · ${Number(result.http) || 0} 次请求</div></div>
+    <div class="card"><div class="row between"><div><span class="name">${esc(result.label || result.uid || "")}</span> ${badge(result.status)}</div>
+      <div class="small">本轮 +${Number(result.credits) || 0} 积分 · ${Number(result.http) || 0} 次请求</div></div>
       <p class="meta">${esc(result.message || "")}</p></div>
-    ${rows ? `<table><tr><th>步骤</th><th>结果</th><th>说明</th></tr>${rows}</table>` : ""}`);
+    ${rows ? `<h2>步骤明细</h2><table><tr><th>步骤</th><th>结果</th><th>说明</th></tr>${rows}</table>` : ""}`);
+}
+
+// 网页内短信登录：两步，零 JS。手机号与备注名用隐藏字段在两步之间传递。
+export function setupPage({ pwd, step = 1, label = "", phone = "", uid = "", notice = "", error = "" }) {
+  const p = q(pwd);
+  const steps = `<div class="steps">
+    <span class="step ${step === 1 ? "on" : ""}"><b>1</b>填手机号</span><span class="step-line"></span>
+    <span class="step ${step === 2 ? "on" : ""}"><b>2</b>填验证码</span></div>`;
+  const banner = error ? `<div class="note error">${esc(error)}</div>`
+    : notice ? `<div class="note success">${esc(notice)}</div>` : "";
+
+  const body = step === 1
+    ? `<form method="post" action="/account/sms/send${p}">
+        ${hidden("pwd", pwd)}
+        <label>备注名</label><input name="label" value="${esc(label)}" placeholder="主号" required>
+        <label>手机号</label><input name="phone" value="${esc(phone)}" inputmode="numeric" autocomplete="tel" placeholder="11 位大陆手机号" required autofocus>
+        <p style="margin-top:20px"><button class="btn primary lg" type="submit">发送验证码 →</button></p>
+        <p class="hint">验证码由 WorkBuddy 官方登录接口下发，本站只经手一次，不保存手机号。</p>
+      </form>`
+    : `<form method="post" action="/account/sms/verify${p}">
+        ${hidden("pwd", pwd)}${hidden("label", label)}${hidden("phone", phone)}
+        <div class="row between"><div><span class="small">账号备注</span><div class="name">${esc(label || "未命名")}</div></div>
+          <div><span class="small">手机号</span><div class="mono">${esc(phone)}</div></div></div>
+        <label>短信验证码</label><input name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="4~8 位数字" required autofocus>
+        <label>账号标识 uid（一般留空，自动从令牌解出）</label><input name="uid" value="${esc(uid)}" placeholder="留空即可">
+        <p style="margin-top:20px"><button class="btn primary lg" type="submit">完成添加</button></p>
+        <p class="hint">换到令牌后由 Worker 直接存入 KV，页面不会显示令牌原文。</p>
+      </form>
+      <p style="margin-top:18px"><a href="/setup${p}">← 换个手机号 / 重新发送</a></p>`;
+
+  return page("添加账号", `<p class="sub">全程在网页完成，不需要跑任何本地命令。</p>
+    <div class="card" style="max-width:560px">${steps}${banner}${body}</div>
+    <div class="note">新版桌面端把登录凭据加密成 <code>$wbEncrypted</code>，本地文件读不出明文，
+      所以走官方短信登录换票。别在多个地方同时登录同一账号：refreshToken 是一次性的，被别处轮换会掉号。</div>`);
 }
 
 export function homePage({ accounts, days, logs, pwd, flash, now }) {
   const totalToday = accounts.reduce((sum, a) => sum + (Number((days[a.uid] || {}).credits) || 0), 0);
+  const totalRounds = accounts.reduce((sum, a) => sum + (Number((days[a.uid] || {}).rounds) || 0), 0);
+  const p = q(pwd);
+
   const cards = accounts.map((a) => {
     const d = days[a.uid] || {};
     const cs = credState(a, now);
     const uid = esc(a.uid);
-    const p = q(pwd);
-    return `<div class="card">
-      <div class="row">
-        <div class="grow"><span class="name">${esc(a.label || "未命名")}</span>
-          <span class="uid">${esc(maskUid(a.uid))}</span></div>
-        <div>${badge(d.checkin || "pending")} ${badge(d.travel || "pending")}</div>
+    return `<div class="card hoverable">
+      <div class="row between">
+        <div><span class="name">${esc(a.label || "未命名")}</span><span class="uid">${esc(maskUid(a.uid))}</span></div>
+        <div class="row">${badge(d.checkin || "pending")}${badge(d.travel || "pending")}</div>
       </div>
-      <div class="meta">凭据 ${badge(cs)} · 今日 +${Number(d.credits) || 0} 积分 · 行程 ${Number(d.rounds) || 0} 趟
-        ${d.lastMessage ? `<br><span class="small">${esc(d.lastMessage)}</span>` : ""}</div>
-      <div class="row" style="margin-top:12px">
-        <form class="inline" method="post" action="/account/${uid}/test${p}">${hidden(pwd)}<button class="btn" type="submit">测试连接</button></form>
-        <form class="inline" method="post" action="/account/${uid}/run${p}">${hidden(pwd)}<button class="btn primary" type="submit">立即执行</button></form>
-        <form class="inline" method="post" action="/account/${uid}/delete${p}">${hidden(pwd)}<button class="btn danger" type="submit">删除</button></form>
-        <form class="inline" method="post" action="/account/${uid}/toggle${p}">${hidden(pwd)}<button class="btn" type="submit">${a.enabled === false ? "启用" : "停用"}</button></form>
+      <div class="row" style="gap:22px;margin-top:12px">
+        <div><span class="small">今日积分</span><div class="name">+${Number(d.credits) || 0}</div></div>
+        <div><span class="small">行程</span><div class="name">${Number(d.rounds) || 0} 趟</div></div>
+        <div><span class="small">凭据</span><div>${badge(cs)}</div></div>
+        <div class="grow"><span class="small">今日状态</span><div class="small" style="margin-top:3px">${esc(d.lastMessage || "尚未运行")}</div></div>
+      </div>
+      <div class="row" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+        <form class="inline" method="post" action="/account/${uid}/test${p}">${hidden("pwd", pwd)}<button class="btn" type="submit">测试连接</button></form>
+        <form class="inline" method="post" action="/account/${uid}/run${p}">${hidden("pwd", pwd)}<button class="btn primary" type="submit">立即执行</button></form>
+        <form class="inline" method="post" action="/account/${uid}/toggle${p}">${hidden("pwd", pwd)}<button class="btn" type="submit">${a.enabled === false ? "启用" : "停用"}</button></form>
+        <form class="inline" method="post" action="/account/${uid}/delete${p}">${hidden("pwd", pwd)}<button class="btn danger" type="submit">删除</button></form>
       </div></div>`;
-  }).join("") || `<div class="note">还没有账号。用下面的表单加一个。</div>`;
+  }).join("") || `<div class="empty">还没有账号。点上面的「短信登录添加账号」，两步就能加好。</div>`;
 
   const recent = (logs || []).slice(0, 5).map((r) => `<tr><td class="small">${esc(r.when)}</td>
     <td>${esc(r.label || r.uid)}</td><td>${badge(r.status)}</td><td>+${Number(r.credits) || 0}</td></tr>`).join("");
 
   return page("总览", `
-    <p class="sub">WorkBuddy · 每日签到 + Buddy 旅行 + 回收积分 ｜ 今日合计 <strong>+${totalToday}</strong></p>
-    ${flash ? `<div class="note">${esc(flash)}</div>` : ""}
+    ${flash ? `<div class="note success">${esc(flash)}</div>` : ""}
+    <div class="hero">
+      <div class="row between">
+        <div><div class="kicker">Today</div><div class="big">+${totalToday}<small>积分</small></div>
+          <div class="desc">WorkBuddy · 每日签到 + Buddy 旅行 + 回收积分</div></div>
+        <a class="btn lg" href="/setup${p}">＋ 短信登录添加账号</a>
+      </div>
+      <div class="stats"><div>账号<strong>${accounts.length}</strong></div>
+        <div>今日行程<strong>${totalRounds} 趟</strong></div>
+        <div>自动运行<strong>每 30 分钟</strong></div></div>
+    </div>
     <div class="note">每 30 分钟自动跑一轮；「立即执行」跳过收工判定，但步骤本身仍然幂等。
       「测试连接」只读登录态、不领取，可能顺带续期并写回新凭据。</div>
     <h2>账号（${accounts.length}）</h2>${cards}
-    <h2>新增账号</h2>
-    <div class="card"><form method="post" action="/account/add${q(pwd)}">
-      ${hidden(pwd)}
-      <label>备注名</label><input name="label" placeholder="主号" required>
-      <label>Access Token（明文 JWT，eyJ 开头）</label><textarea name="accessToken" required></textarea>
-      <label>Refresh Token</label><textarea name="refreshToken" required></textarea>
-      <label>账号标识 uid（可留空，默认从 JWT 的 sub 解）</label><input name="uid" placeholder="留空即可">
-      <p style="margin-top:14px"><button class="btn primary" type="submit">保存账号</button></p>
-    </form>
-    <p class="small">凭据只存在你自己 Cloudflare 账号的 KV 里。取 token 的方法见 README。</p></div>
+    <h2>其他添加方式</h2>
+    <details><summary>手填 Access Token / Refresh Token（兜底）</summary>
+      <form method="post" action="/account/add${p}" style="padding-bottom:18px">
+        ${hidden("pwd", pwd)}
+        <label>备注名</label><input name="label" placeholder="主号" required>
+        <label>Access Token（明文 JWT，eyJ 开头）</label><textarea name="accessToken" required></textarea>
+        <label>Refresh Token</label><textarea name="refreshToken" required></textarea>
+        <label>账号标识 uid（可留空，默认从 JWT 的 sub 解）</label><input name="uid" placeholder="留空即可">
+        <p style="margin-top:16px"><button class="btn primary" type="submit">保存账号</button></p>
+      </form></details>
     <h2>最近运行</h2>
     ${recent ? `<table><tr><th>时间</th><th>账号</th><th>结果</th><th>积分</th></tr>${recent}</table>
-      <p><a href="/runs${q(pwd)}">查看全部日志 →</a></p>` : `<p class="small">还没有运行记录。</p>`}`);
+      <p style="margin-top:12px"><a href="/runs${p}">查看全部日志 →</a></p>` : `<div class="empty">还没有运行记录。</div>`}`);
 }
 
 export function runsPage({ logs, pwd }) {
@@ -99,6 +149,6 @@ export function runsPage({ logs, pwd }) {
     <td class="small">${esc(r.trigger || "")}</td><td>${esc(r.message || "")}</td></tr>`).join("");
   return page("运行日志", `<p class="sub">保留 30 天，最新在前。</p>
     ${rows ? `<table><tr><th>时间</th><th>账号</th><th>结果</th><th>积分</th><th>触发</th><th>说明</th></tr>${rows}</table>`
-      : `<div class="note">还没有运行记录。</div>`}
+      : `<div class="empty">还没有运行记录。</div>`}
     <p style="margin-top:18px"><a href="/${q(pwd)}">← 回到总览</a></p>`);
 }

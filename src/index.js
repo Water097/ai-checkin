@@ -1,6 +1,6 @@
 import { authenticate } from "./core/gate.js";
 import { htmlRes, jsonRes, esc } from "./core/http.js";
-import { renderGate, renderFatal, renderUnconfigured, renderResult, homePage, runsPage } from "./ui.js";
+import { renderGate, renderFatal, renderUnconfigured, renderResult, homePage, runsPage, setupPage } from "./ui.js";
 import { requireKv } from "./core/kv.js";
 import { listAccounts, getAccount, saveAccount, deleteAccount } from "./core/accounts.js";
 import { runTick, runAccount, validateAccount, nowSec } from "./core/runner.js";
@@ -8,6 +8,7 @@ import { makeBudget, budgetFrom } from "./core/budget.js";
 import { listLogs } from "./core/logs.js";
 import { dayOf, loadDay } from "./core/state.js";
 import { uidOf } from "./wb/api.js";
+import { sendSms, exchangeToken, validPhone, maskPhone } from "./wb/login.js";
 import { expiresAtOf, isEncrypted } from "./core/jwt.js";
 import { VERSION } from "./version.js";
 
@@ -43,6 +44,7 @@ async function dispatch(request, url, env, auth) {
   // 口令闸页提交表单：鉴权已通过，转成带 pwd 的 GET 回首页。
   if (method === "POST" && path === "/") return redirect("/", pwd);
   if (method === "GET" && path === "/runs") return htmlRes(runsPage({ logs: await listLogs(kv, 60), pwd }));
+  if (method === "GET" && path === "/setup") return htmlRes(setupPage({ pwd }));
 
   if (method === "GET" && path === "/api/health") {
     return jsonRes({ ok: true, version: VERSION, now: nowSec(), day: dayOf(nowSec()) });
@@ -51,6 +53,39 @@ async function dispatch(request, url, env, auth) {
   // 手动触发整轮，方便部署后不用等 cron 就能验证。
   if ((method === "GET" || method === "POST") && path === "/api/tick") {
     return jsonRes(await runTick({ env, now: nowSec(), trigger: "manual" }));
+  }
+
+  // ── 网页内短信登录：两步，零 JS，手机号与备注名用隐藏字段在两步间传递 ──
+  if (method === "POST" && path === "/account/sms/send") {
+    const label = String(form.get("label") || "").trim() || "未命名";
+    const phone = String(form.get("phone") || "").trim();
+    const back = (error) => htmlRes(setupPage({ pwd, step: 1, label, phone, error }));
+    if (!validPhone(phone)) return back("手机号格式不对，请填 11 位大陆手机号");
+    const result = await sendSms(phone);
+    if (!result.ok) return back(result.message);
+    return htmlRes(setupPage({
+      pwd, step: 2, label, phone,
+      notice: `验证码已发送至 ${maskPhone(phone)}，${result.message}`,
+    }));
+  }
+
+  if (method === "POST" && path === "/account/sms/verify") {
+    const label = String(form.get("label") || "").trim() || "未命名";
+    const phone = String(form.get("phone") || "").trim();
+    const code = String(form.get("code") || "").trim();
+    const uidInput = String(form.get("uid") || "").trim();
+    const back = (error) => htmlRes(setupPage({ pwd, step: 2, label, phone, uid: uidInput, error }));
+    const result = await exchangeToken(phone, code);
+    if (!result.ok) return back(result.message);
+    if (isEncrypted(result.accessToken)) return back("拿到的是加密票据，请重新发送验证码");
+    const uid = uidInput || uidOf({ accessToken: result.accessToken, refreshToken: result.refreshToken });
+    if (!uid) return back("解不出账号标识，请在「账号标识 uid」一栏手填");
+    const exp = expiresAtOf(result.accessToken);
+    await saveAccount(kv, uid, {
+      uid, label, enabled: true, createdAt: Date.now(),
+      cred: { accessToken: result.accessToken, refreshToken: result.refreshToken, expiresAt: exp ? String(exp) : "" },
+    });
+    return flash(`账号「${label}」已通过短信登录添加`, pwd);
   }
 
   if (method === "POST" && path === "/account/add") {

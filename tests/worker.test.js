@@ -45,7 +45,7 @@ test("口令正确 → 总览页 200，无任何 JavaScript", async () => {
   assert.equal(res.status, 200);
   const html = await res.text();
   assert.match(html, /总览/);
-  assert.match(html, /新增账号/);
+  assert.match(html, /短信登录添加账号/);
   assert.equal(html.includes("<script"), false);
   assert.match(res.headers.get("content-security-policy"), /default-src 'none'/);
 });

@@ -8,7 +8,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "bundle": "wrangler deploy --dry-run --outdir=dist",
-    "test": "node --test tests/core.test.js tests/wb.test.js tests/worker.test.js"
+    "test": "node --test tests/core.test.js tests/wb.test.js tests/worker.test.js tests/login.test.js"
   },
   "devDependencies": {
     "wrangler": "^4.144.0"
