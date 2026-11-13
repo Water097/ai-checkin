@@ -1,13 +1,13 @@
 import { authenticate } from "./core/gate.js";
 import { htmlRes, jsonRes, esc } from "./core/http.js";
-import { renderGate, renderFatal, renderUnconfigured, renderResult, homePage, runsPage, setupPage } from "./ui.js";
+import { renderGate, renderFatal, renderUnconfigured, renderResult, homePage, runsPage, setupPage, travelStatusPage } from "./ui.js";
 import { requireKv } from "./core/kv.js";
-import { listAccounts, getAccount, saveAccount, deleteAccount } from "./core/accounts.js";
+import { listAccounts, getAccount, saveAccount, deleteAccount, secretValuesOf } from "./core/accounts.js";
 import { runTick, runAccount, validateAccount, nowSec } from "./core/runner.js";
-import { makeBudget, budgetFrom } from "./core/budget.js";
-import { listLogs } from "./core/logs.js";
+import { makeBudget, budgetFrom, trackedFetch } from "./core/budget.js";
+import { listLogs, scrub } from "./core/logs.js";
 import { dayOf, loadDay } from "./core/state.js";
-import { uidOf } from "./wb/api.js";
+import { uidOf, HOSTS, readTravelStatus, travelStateOf, ensureAuth, isAuthFail } from "./wb/api.js";
 import { sendSms, exchangeToken, validPhone, maskPhone } from "./wb/login.js";
 import { expiresAtOf, isEncrypted } from "./core/jwt.js";
 import { VERSION } from "./version.js";
@@ -45,6 +45,41 @@ async function dispatch(request, url, env, auth) {
   if (method === "POST" && path === "/") return redirect("/", pwd);
   if (method === "GET" && path === "/runs") return htmlRes(runsPage({ logs: await listLogs(kv, 60), pwd }));
   if (method === "GET" && path === "/setup") return htmlRes(setupPage({ pwd }));
+
+  // 只读诊断：把上游旅行状态的原始响应摆出来，字段变了不用再猜。
+  const travelMatch = /^\/travel\/([^/]+)$/.exec(path);
+  if (method === "GET" && travelMatch) {
+    let uid;
+    try { uid = decodeURIComponent(travelMatch[1]); } catch { return htmlRes(renderFatal("路径编码不合法"), 400); }
+    const account = await getAccount(kv, uid);
+    if (!account) return flash("账号不存在或记录已损坏", pwd);
+    const budget = makeBudget(budgetFrom(env));
+    const now = nowSec();
+    const ctx = {
+      account, kv, budget, now, day: dayOf(now), trigger: "diagnose",
+      timeoutMs: 15000, fetch: trackedFetch(budget, HOSTS),
+      secrets: secretValuesOf(account), renewAttempted: false,
+    };
+    let error = "";
+    let payload = null;
+    try {
+      const guard = await ensureAuth(ctx);
+      if (guard.error) error = guard.error;
+      else {
+        const res = await readTravelStatus(ctx);
+        payload = res.payload;
+        if (isAuthFail(res)) error = `上游返回 ${res.status}，凭据可能已失效`;
+      }
+    } catch (e) { error = String((e && e.message) || e); }
+    const secrets = [...new Set([...ctx.secrets, ...secretValuesOf(account)])];
+    if (payload) {
+      try { payload = JSON.parse(scrub(JSON.stringify(payload), secrets)); } catch { /* 保底只显示解析结论 */ }
+    }
+    return htmlRes(travelStatusPage({
+      pwd, uid, label: account.label, payload,
+      info: payload ? travelStateOf(payload) : null, error,
+    }));
+  }
 
   if (method === "GET" && path === "/api/health") {
     return jsonRes({ ok: true, version: VERSION, now: nowSec(), day: dayOf(nowSec()) });

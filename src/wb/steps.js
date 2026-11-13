@@ -3,7 +3,7 @@
 import * as api from "./api.js";
 import { scrub, truncate } from "../core/logs.js";
 
-function guarded(ctx, guard) {
+function guarded(guard) {
   if (guard && guard.error) {
     return { status: "login_required", message: guard.error, credits: 0 };
   }
@@ -14,13 +14,15 @@ function warnOf(guard) {
   return guard && guard.warn ? `（${guard.warn}）` : "";
 }
 
+const truthy = (v) => v === true || v === 1 || v === "true" || v === "1";
+
 // ── 每日签到 ────────────────────────────────────────────────────────────
 export async function runCheckin(ctx, day) {
   if (["claimed", "already", "inactive"].includes(day.checkin)) {
     return { status: "reused", message: "签到今日已处理", credits: 0 };
   }
   const guard = await api.ensureAuth(ctx);
-  const blocked = guarded(ctx, guard);
+  const blocked = guarded(guard);
   if (blocked) return blocked;
 
   const status = await api.readStatus(ctx);
@@ -45,58 +47,71 @@ export async function runCheckin(ctx, day) {
   };
 }
 
-// ── 旅行：读到站状态 → 收礼 → 再派下一趟 ────────────────────────────────
-// 不做阻塞等待：Worker 里阻塞等于烧子请求 + 撞超时。
-// 改成每 30 分钟轻量轮询，服务端说 arrived 才 claim，说 traveling 就本轮收手。
+// ── 旅行：读状态 → 有礼先收 → 再派下一趟 ────────────────────────────────
+// 不做阻塞等待：Worker 里阻塞等于烧子请求 + 撞超时，改成每 30 分钟轻量轮询。
+//
+// 关键：绝不把「认不出来的状态」当成 idle。上游状态字段换过版、也可能藏在
+// travel / trip 子对象里；认错成 idle 会直接派新行程，把待领的礼物顶掉。
+// 所以状态不明确时先试一次 claim（幂等），让上游自己回答有没有礼物。
 export async function runTravel(ctx, day) {
   if (day.travel === "done") {
     return { status: "reused", message: "旅行今日已收工", credits: 0 };
   }
   const guard = await api.ensureAuth(ctx);
-  const blocked = guarded(ctx, guard);
+  const blocked = guarded(guard);
   if (blocked) return blocked;
 
   const first = await api.readTravelStatus(ctx);
   if (api.isAuthFail(first)) {
     return { status: "login_required", message: "旅行状态被拒，凭据可能已失效", credits: 0 };
   }
-  const state = api.dig(first.payload, "state");
-  const limit = api.dig(first.payload, "daily_limit_reached");
-  const notes = [];
+
+  const info = api.travelStateOf(first.payload);
+  // 把判定依据写进日志：下次上游再换字段，看一条运行记录就知道我们读到了什么。
+  const notes = [`state=${info.raw} → ${info.kind}`];
   let credits = 0;
 
-  if (state === "arrived") {
-    const claimed = await api.claimTravel(ctx);
-    const reward = api.dig(claimed.payload, "reward_credit");
-    if (claimed.status >= 400 || reward === null || reward === undefined) {
-      // 领奖失败绝不派新行程：一失败就当 idle 去派，会把这次已到站的礼物顶掉。
-      return { status: "error", message: `到站礼物领取失败（HTTP ${claimed.status}），本次不派新行程`, credits: 0 };
-    }
-    credits += api.num(reward);
-    notes.push(`回收到站礼物 +${api.num(reward)}`);
-    day.rounds = day.rounds || 0;
-  } else if (state === "traveling") {
-    const arriveAt = api.dig(first.payload, "arrive_at");
-    const hint = arriveAt ? `（预计 ${String(arriveAt).slice(0, 16)}）` : "";
-    return { status: "waiting", message: `旅行在途，到站后再收${hint}`, credits: 0 };
+  if (info.kind === "traveling") {
+    const arriveAt = api.dig(first.payload, "arrive_at") ?? api.dig(first.payload, "arrive_time");
+    notes.push(`旅行在途，不重复出发${arriveAt ? `（预计 ${String(arriveAt).slice(0, 16)}）` : ""}`);
+    return { status: "waiting", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits: 0 };
   }
 
-  if (limit === true || limit === 1) {
+  // claimable / unknown 都先收礼；只有明确 idle 才跳过 claim 省一次请求。
+  if (info.kind !== "idle") {
+    const judged = api.judgeClaimTravel(await api.claimTravel(ctx));
+    if (judged.kind === "claimed") {
+      credits += judged.credits;
+      notes.push(judged.message);
+      day.rounds = day.rounds || 0;
+    } else if (judged.kind === "no_gift") {
+      notes.push(judged.message);
+    } else {
+      // 领取失败绝不派新行程：一失败就当 idle 去派，会把这次已到站的礼物顶掉。
+      notes.push(`${judged.message}，本次不派新行程`);
+      return { status: "error", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits };
+    }
+  }
+
+  const limit = api.dig(first.payload, "daily_limit_reached") ?? api.dig(first.payload, "daily_limit");
+  if (truthy(limit)) {
     notes.push("今日旅行次数已用尽");
-    return { status: "done", message: notes.join("，"), credits };
+    return { status: "done", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits };
   }
 
   const config = await api.readTravelConfig(ctx);
   const places = api.pickLocations(api.dig(config.payload, "locations") || []);
   if (!places.length) {
-    return { status: "error", message: `${notes.join("，")}但旅行配置里没有可选地点`.replace(/^，/, ""), credits };
+    notes.push("旅行配置里没有可选地点，未派出");
+    return { status: "error", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits };
   }
 
   // 第一个地点被下线就换下一个，固定只用第一个会每轮都失败。
   const rejected = [];
   for (const place of places.slice(0, 3)) {
     const depart = await api.departTravel(ctx, place.id);
-    if (depart.status < 400) {
+    // HTTP 200 不等于成功：业务码非 0 也是失败，不能报「已派新行程」。
+    if (api.okResult(depart)) {
       const name = api.dig(depart.payload, "location")?.name || place.name || place.id;
       notes.push(`已派新行程 → ${name}`);
       return { status: "departed", message: truncate(scrub(notes.join("，") + warnOf(guard), ctx.secrets)), credits };
@@ -104,13 +119,18 @@ export async function runTravel(ctx, day) {
     const why = api.classifyDepart(depart);
     if (why === "limit") {
       notes.push("今日旅行次数已用尽");
-      return { status: "done", message: notes.join("，"), credits };
+      return { status: "done", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits };
     }
     if (why === "traveling") {
-      return { status: "waiting", message: [...notes, "已在旅途中，不重复出发"].join("，"), credits };
+      notes.push("已在旅途中，不重复出发");
+      return { status: "waiting", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits };
     }
     if (why === "location") { rejected.push(place.name || place.id); continue; }
-    return { status: "error", message: [...notes, `派发失败 HTTP ${depart.status}`].join("，"), credits };
+    const detail = api.bizMessage(depart);
+    const code = api.codeOf(depart.payload);
+    notes.push(`派发失败 HTTP ${depart.status}${code != null ? ` code=${code}` : ""}${detail ? ` ${detail}` : ""}，未派出`);
+    return { status: "error", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits };
   }
-  return { status: "error", message: [...notes, `可用地点都派不出去：${rejected.join("、")}`].join("，"), credits };
+  notes.push(`可用地点都派不出去：${rejected.join("、")}，未派出`);
+  return { status: "error", message: truncate(scrub(notes.join("，"), ctx.secrets)), credits };
 }

@@ -105,6 +105,10 @@ details[open] summary{border-bottom:1px solid var(--line);margin-bottom:8px}
 .step.on{color:var(--brand)}
 .step.on b{background:var(--brand);color:#fff}
 .step-line{width:28px;height:1px;background:#e4e7ec}
+pre{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:14px 16px;font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;color:#344054;white-space:pre-wrap;word-break:break-all;max-height:420px;overflow:auto;margin:0}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:8px 14px;font-size:13px;margin:12px 0}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;font-weight:600;overflow-wrap:anywhere}
 footer{text-align:center;color:#b3bac7;font-size:12px;margin-top:40px}
 @media(max-width:640px){main{padding:8px 16px 56px}.topbar{padding:16px}.hero{padding:22px}.hero .big{font-size:32px}.stats{gap:16px}.card{padding:16px}}
 `;

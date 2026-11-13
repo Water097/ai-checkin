@@ -104,6 +104,7 @@ export function homePage({ accounts, days, logs, pwd, flash, now }) {
       </div>
       <div class="row" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
         <form class="inline" method="post" action="/account/${uid}/test${p}">${hidden("pwd", pwd)}<button class="btn" type="submit">测试连接</button></form>
+        <a class="btn" href="/travel/${uid}${p}">旅行状态</a>
         <form class="inline" method="post" action="/account/${uid}/run${p}">${hidden("pwd", pwd)}<button class="btn primary" type="submit">立即执行</button></form>
         <form class="inline" method="post" action="/account/${uid}/toggle${p}">${hidden("pwd", pwd)}<button class="btn" type="submit">${a.enabled === false ? "启用" : "停用"}</button></form>
         <form class="inline" method="post" action="/account/${uid}/delete${p}">${hidden("pwd", pwd)}<button class="btn danger" type="submit">删除</button></form>
@@ -141,6 +142,34 @@ export function homePage({ accounts, days, logs, pwd, flash, now }) {
     <h2>最近运行</h2>
     ${recent ? `<table><tr><th>时间</th><th>账号</th><th>结果</th><th>积分</th></tr>${recent}</table>
       <p style="margin-top:12px"><a href="/runs${p}">查看全部日志 →</a></p>` : `<div class="empty">还没有运行记录。</div>`}`);
+}
+
+// 只读诊断页：把上游旅行状态的原始响应摆出来，避免再靠猜字段。
+export function travelStatusPage({ pwd, uid, label, payload, info, error }) {
+  const p = q(pwd);
+  const kindText = {
+    claimable: "有礼可领（会先收礼）", traveling: "旅途中（不重复出发）",
+    idle: "空闲（可直接派）", unknown: "未识别（会先试领取）",
+  };
+  const raw = payload ? JSON.stringify(payload, null, 2) : "（无响应）";
+  const tone = info?.kind === "claimable" ? "claimed" : info?.kind === "traveling" ? "waiting" : "pending";
+  return page("旅行状态诊断", `
+    <p class="sub">只读诊断：不领礼物、不派行程、不改任何状态。用来确认上游到底返回了什么。</p>
+    ${error ? `<div class="note error">${esc(error)}</div>` : ""}
+    <div class="card">
+      <div class="row between"><div><span class="name">${esc(label)}</span><span class="uid">${esc(uid)}</span></div>${badge(tone)}</div>
+      <dl class="kv">
+        <dt>解析结论</dt><dd>${esc(kindText[info?.kind] || "未识别")}</dd>
+        <dt>命中的字段</dt><dd class="mono">${esc(info?.path || "—")} = ${esc(info?.value || "—")}</dd>
+        <dt>扫描到的状态</dt><dd class="mono">${esc(info?.raw || "—")}</dd>
+        <dt>下一步动作</dt><dd>${esc(info?.kind === "traveling" ? "等下一轮到站后再收"
+          : info?.kind === "idle" ? "可以派新行程" : "先试领取，成功后再派")}</dd>
+      </dl></div>
+    <h2>上游原始响应</h2><pre>${esc(raw)}</pre>
+    <div class="row" style="margin-top:18px">
+      <form class="inline" method="post" action="/account/${esc(uid)}/run${p}">${hidden("pwd", pwd)}<button class="btn primary" type="submit">立即执行</button></form>
+      <a class="btn" href="/${p}">返回总览</a></div>
+    <div class="note">显示「未识别」就把上面原始响应贴出来，一眼能定位字段名。响应里的票据已脱敏。</div>`);
 }
 
 export function runsPage({ logs, pwd }) {

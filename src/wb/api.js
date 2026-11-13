@@ -182,11 +182,91 @@ export function pickLocations(locations) {
     .sort((a, b) => score(b) - score(a));
 }
 
+// HTTP 200 不等于成功：上游大量业务错误是 code != 0 配 200 返回的。
+export function okResult(result) {
+  const code = codeOf(result.payload);
+  return result.status < 400 && (code === null || code === 0);
+}
+
+export function bizMessage(result) {
+  const p = result.payload || {};
+  return String(p.msg ?? p.message ?? "").slice(0, 120);
+}
+
+const STATE_KEYS = [
+  "state", "status", "travel_state", "travelStatus", "trip_state", "tripStatus",
+  "buddy_state", "buddyStatus", "phase", "stage", "travel_state_code",
+];
+const CLAIMABLE = /^(arrived|claimable|pending_?claim|waiting_?claim|can_?claim|finished|completed|done|reward_?pending|unclaimed|ready_?to_?claim)$|待领|可领|到站|已完成|可领取|领取礼物|待收取|等待领取/i;
+const TRAVELING = /^(travel+ing|in_?transit|on_?trip|departed|running|in_?progress|ongoing|started)$|旅途中|派送中|进行中|在途|已出发/i;
+const IDLE = /^(idle|none|not_?started|ready|unstarted)$|未开始|未出发|待出发/i;
+const NO_GIFT = /no_?reward|nothing_?to_?claim|not_?arrived|already_?claimed|no_?gift|无可领|未到站|已领取|尚未到达|没有.*礼物|nothing.*claim/i;
+
+// 上游状态字段换过版、也可能藏在 travel / trip / buddy 这类子对象里。
+// 不再假设单一键名：受限深度遍历整份响应，收集所有可能的状态值，按「有礼可领 → 在途 → 空闲」的优先顺序判定。
+// 优先顺序很重要：认错成 idle 会直接派新行程，把待领的礼物顶掉，这是最贵的错。
+export function travelStateOf(payload) {
+  const found = [];
+  const walk = (node, depth, path) => {
+    if (!node || typeof node !== "object" || Array.isArray(node) || depth > 5) return;
+    for (const [key, value] of Object.entries(node)) {
+      if (STATE_KEYS.includes(key) && (typeof value === "string" || typeof value === "number")) {
+        found.push({ key, value: String(value), path: `${path}.${key}` });
+      }
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        walk(value, depth + 1, `${path}.${key}`);
+      }
+    }
+  };
+  walk(payload, 0, "$");
+
+  const raw = found.length ? found.map((f) => `${f.path}=${f.value}`).join(", ").slice(0, 200) : "未找到状态字段";
+  const pick = (re) => {
+    const hit = found.find((f) => re.test(f.value));
+    return hit ? { ...hit, raw, found } : null;
+  };
+  const claimable = pick(CLAIMABLE);
+  if (claimable) return { kind: "claimable", ...claimable };
+  const traveling = pick(TRAVELING);
+  if (traveling) return { kind: "traveling", ...traveling };
+  const idle = pick(IDLE);
+  if (idle) return { kind: "idle", ...idle };
+
+  // 状态全认不出来时，奖励信号也能救一次：有可领奖励就先收。
+  const reward = num(dig(payload, "reward_credit"));
+  const canClaim = dig(payload, "can_claim");
+  const hasReward = dig(payload, "has_reward");
+  if (reward > 0 || canClaim === true || hasReward === true) {
+    return { kind: "claimable", value: "奖励信号", path: "$", raw, found };
+  }
+  return { kind: "unknown", value: "未识别", path: "$", raw, found };
+}
+
+// 领取结果三分：收到了 / 上游明确说没礼物 / 真失败。
+// 「没礼物」要走继续派发的路，不能当成失败把流程卡死。
+export function judgeClaimTravel(result) {
+  const code = codeOf(result.payload);
+  const msg = bizMessage(result);
+  const text = `${msg} ${String(result.raw || "")}`;
+  if (NO_GIFT.test(text) || code === 10001) {
+    return { kind: "no_gift", credits: 0, message: "上游报没有待领礼物" };
+  }
+  if (okResult(result)) {
+    const reward = dig(result.payload, "reward_credit") ?? dig(result.payload, "credit") ?? dig(result.payload, "reward");
+    return { kind: "claimed", credits: num(reward), message: `回收到站礼物 +${num(reward)}` };
+  }
+  return {
+    kind: "failed", credits: 0,
+    message: `领取失败 HTTP ${result.status}${code != null ? ` code=${code}` : ""}${msg ? ` ${msg}` : ""}`,
+  };
+}
+
 // 派发被拒时要分流：今日用尽 / 已在途中 / 该地点不可用（换下一个）/ 真失败。
 export function classifyDepart(result) {
-  if (result.status === 403 || result.status === 409) return "traveling";
-  const text = `${String((result.payload && result.payload.msg) || "")} ${String(result.raw || "")}`.toLowerCase();
+  const text = `${bizMessage(result)} ${String(result.raw || "")}`.toLowerCase();
   if (result.status === 429 || /limit|用尽|已达上限|daily_limit/.test(text)) return "limit";
-  if (/location|地点|available/.test(text)) return "location";
+  if (result.status === 403 || result.status === 409
+    || /already_?travel|已有行程|旅途中|in ?progress/.test(text)) return "traveling";
+  if (/location|地点|available|不可选/.test(text)) return "location";
   return "other";
 }
